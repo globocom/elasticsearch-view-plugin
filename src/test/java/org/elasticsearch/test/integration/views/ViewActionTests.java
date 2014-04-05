@@ -1,183 +1,157 @@
-/*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
 package org.elasticsearch.test.integration.views;
 
+import static junit.framework.Assert.assertEquals;
+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+import static org.junit.Assert.fail;
 
-import com.github.tlrx.elasticsearch.test.EsSetup;
+import java.io.IOException;
+
+import org.elasticsearch.ElasticSearchException;
 import org.elasticsearch.action.view.ViewAction;
 import org.elasticsearch.action.view.ViewRequest;
 import org.elasticsearch.action.view.ViewResponse;
+import org.elasticsearch.common.network.NetworkUtils;
 import org.elasticsearch.common.settings.ImmutableSettings;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.node.Node;
+import org.elasticsearch.node.NodeBuilder;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import static com.github.tlrx.elasticsearch.test.EsSetup.*;
-import static junit.framework.Assert.*;
-import static junit.framework.Assert.assertEquals;
-
 public class ViewActionTests {
 
-    EsSetup esSetup;
+    private static final String TEST_TYPE = "car";
+	private static final String TEST_INDEX = "testview";
+	private Node node = null;
 
+    protected Settings buildNodeSettings() {
+        ImmutableSettings.Builder builder = ImmutableSettings.settingsBuilder()
+                .put("node.name", "node-test")
+                .put("node.data", true)
+                .put("cluster.name", "cluster-test-" + NetworkUtils.getLocalAddress().getHostName())
+                .put("index.store.type", "memory")
+                .put("index.store.fs.memory.enabled", "true")
+                .put("gateway.type", "none")
+                .put("path.data", "./target/elasticsearch-test/data")
+                .put("path.work", "./target/elasticsearch-test/work")
+                .put("path.logs", "./target/elasticsearch-test/logs")
+                .put("index.number_of_shards", "1")
+                .put("index.number_of_replicas", "0")
+                .put("cluster.routing.schedule", "50ms")
+                .put("node.local", true);
+        
+		return builder.build();
+    }
+    
     @Before
     public void setUp() {
+    	node = NodeBuilder.nodeBuilder().settings(buildNodeSettings()).node();
+		node.client().admin().indices().prepareDelete().execute().actionGet();
 
-        // Instantiates a local node & client with few templates in config dir
-        esSetup = new EsSetup(ImmutableSettings
-                                .settingsBuilder()
-                                    .put("path.conf", "./target/test-classes/org/elasticsearch/test/integration/views/config/")
-                                    .build());
-
-        // Clean all and create test org.elasticsearch.test.integration.views.mappings.data
-        esSetup.execute(
-
-                deleteAll(),
-
-                createIndex("catalog")
-                        .withMapping("product", fromClassPath("org/elasticsearch/test/integration/views/mappings/product.json"))
-                        .withData(fromClassPath("org/elasticsearch/test/integration/views/data/products.json")),
-
-                createIndex("manufacturers")
-                        .withMapping("brand", fromClassPath("org/elasticsearch/test/integration/views/mappings/brand.json"))
-                        .withData(fromClassPath("org/elasticsearch/test/integration/views/data/brands.json"))
-        );
+		indexTestDocument(TEST_INDEX, TEST_TYPE, "1", "ix-35", "hyundai");
+		indexTestDocument(TEST_INDEX, TEST_TYPE, "2", "sportage", "kia");
+		createView();
     }
+
+	private void createView() {
+		XContentBuilder xbMapping = null;
+		try {
+			xbMapping = jsonBuilder().startObject()
+				.startObject(TEST_TYPE)
+					.startObject("_meta")
+						.startObject("views")
+							.startObject("default")
+								.field("view", "Car: {{_source.name}}, Brand: {{_source.brand}}")
+							.endObject()
+						.endObject()
+					.endObject()
+				.endObject();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		putMapping(xbMapping);
+	}
+	
+	private void indexQuery() {
+		XContentBuilder xbMapping = null;
+		try {
+			xbMapping = jsonBuilder().startObject()
+				.startObject("query_views")
+					.startObject("default")
+						.startObject("queries")
+							.startObject("all_documents")
+								.field("indices", TEST_INDEX)
+								.startArray("types")
+									.value(TEST_TYPE)
+								.endArray()
+								.startObject("query")
+									.startObject("match_all")
+								.endObject()
+							.endObject()
+						.endObject()
+					.endObject()
+					.field("view", "[{{#_queries}}{{#all_documents}}{{#_source}}{\"Car\": \"{{name}}\"}{{^last}},{{/last}}{{/_source}}{{/all_documents}}{{/_queries}}]")
+				.endObject();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		
+		node.client().prepareIndex("queryindex", "queries", "all").setRefresh(true).setSource(xbMapping)
+				.execute().actionGet();
+	}
+
+	private void putMapping(XContentBuilder xbMapping) {
+		node.client().admin().indices().preparePutMapping(TEST_INDEX)
+				.setType(TEST_TYPE).setSource(xbMapping).execute().actionGet();
+	}
+
+	private void indexTestDocument(String index, String type, String id, String name, String brand) {
+		try {
+			node.client().prepareIndex(index, type, id).setRefresh(true).setSource(jsonBuilder()
+					.startObject().field("name", name).field("brand", brand).endObject())
+					.execute().actionGet();
+		} catch (ElasticSearchException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
 
     @Test
     public void testDefaultView() throws Exception {
-        ViewResponse response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("catalog", "product", "1")).get();
-        assertEquals("Rendering the document #1 in version 1 of type product from index catalog", new String(response.content(), "UTF-8"));
-    }
-
-    @Test
-    public void testFullView() throws Exception {
-        ViewResponse response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("catalog", "product", "2").format("full")).get();
-        assertEquals("<div id=\"product-2\"><h2>Detail of 1952 ALPINE RENAULT 1300</h2><p>Year: 1952, price: 98.58€</p><p>Turnable front wheels; steering function; detailed interior; detailed engine; opening hood; opening trunk; opening doors; and detailed chassis.</p><p>© Copyright Renault</p></div>", new String(response.content(), "UTF-8"));
-    }
-
-    @Test
-    public void testBinaryView() throws Exception {
-        ViewResponse response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("catalog", "product", "1").format("logo")).get();
-        assertNotNull(response.content());
-        assertEquals(0, response.content().length);
-
-        response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("catalog", "product", "2").format("logo")).get();
-        assertNotNull(response.content());
-        assertEquals(61752, response.content().length);
+        ViewResponse response = node.client().execute(ViewAction.INSTANCE, new ViewRequest(TEST_INDEX, TEST_TYPE, "1")).get();
+        assertEquals("Car: ix-35, Brand: hyundai", new String(response.getSourceTransformResult()));
+        ViewResponse response2 = node.client().execute(ViewAction.INSTANCE, new ViewRequest(TEST_INDEX, TEST_TYPE, "2")).get();
+        assertEquals("Car: sportage, Brand: kia", new String(response2.getSourceTransformResult()));
     }
 
     @Test
     public void testUndefinedView() throws Exception {
         try {
-            ViewResponse response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("catalog", "product", "1").format("undefined")).get();
+        	String indexWithoutViews = "indexwithoutviews";
+        	indexTestDocument(indexWithoutViews, TEST_TYPE, "1", "ix-35", "hyundai");
+            node.client().execute(ViewAction.INSTANCE, new ViewRequest(indexWithoutViews, TEST_TYPE, "1")).get();
             fail("Exception expected!");
         } catch (Exception e) {
-            assertEquals("org.elasticsearch.view.exception.ElasticSearchViewNotFoundException: No view [undefined] found for document type [product]", e.getMessage());
+			assertEquals(
+					"org.elasticsearch.view.exception.ElasticSearchViewNotFoundException: "
+							+ "No view [default] found for document type [car]",
+					e.getMessage());
         }
     }
 
     @Test
     public void testCustomView() throws Exception {
+    	indexQuery();
 
-        // Index a custom view
-        esSetup.execute(
-            index("catalog", "list-of-products-by-size", "1:10")
-                .withSource("{\n" +
-                        "    \"views\":{\n" +
-                        "        \"default\":{\n" +
-                        "            \"view_lang\": \"mvel\",\n" +
-                        "            \"queries\": {\n" +
-                        "                \"products_with_size_1_10\": {\n" +
-                        "                    \"indices\": \"catalog\",\n" +
-                        "                    \"types\": [\"product\"],\n" +
-                        "                    \"query\" : {\n" +
-                        "                          \"constant_score\" : {\n" +
-                        "                              \"filter\" : {\n" +
-                        "                                  \"term\" : { \"scale\" : \"1:10\"}\n" +
-                        "                              }\n" +
-                        "                          }\n" +
-                        "                    }\n" +
-                        "                }\n" +
-                        "            },\n" +
-                        "            \"view\" : \"@includeNamed{'list-of-products'; title='List of products'}\"\n" +
-                        "        }\n" +
-                        "    }\n" +
-                        "}")
-        );
-
-        ViewResponse response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("catalog", "list-of-products-by-size", "1:10")).get();
-        assertEquals(fromClassPath("org/elasticsearch/test/integration/views/config/views/list-of-products.html").toString(), new String(response.content(), "UTF-8"));
+        ViewResponse response = node.client().execute(ViewAction.INSTANCE, new ViewRequest("queryindex", "queries", "all")).get();
+        assertEquals("[{\"Car\": \"ix-35\"},{\"Car\": \"sportage\"}]", new String(response.getSourceTransformResult()));
     }
-
-    @Test
-    public void testCustomViewWithMultipleQueries() throws Exception {
-
-        // Index a custom view
-        esSetup.execute(
-                index("web", "pages", "home")
-                        .withSource("{\n" +
-                                "    \"views\": {\n" +
-                                "        \"default\": {\n" +
-                                "            \"view_lang\": \"mvel\",\n" +
-                                "            \"queries\": [\n" +
-                                "                {\n" +
-                                "                    \"products_with_price_lower_than_50\": {\n" +
-                                "                        \"indices\": \"catalog\",\n" +
-                                "                        \"types\": [\"product\"],\n" +
-                                "                        \"query\" : {\n" +
-                                "                              \"constant_score\" : {\n" +
-                                "                                  \"filter\" : {\n" +
-                                "                                      \"range\" : { \"price\" : { \"to\": 50, \"include_upper\": true } }\n" +
-                                "                                  }\n" +
-                                "                              }\n" +
-                                "                        }\n" +
-                                "                    }\n" +
-                                "                },\n" +
-                                "                {\n" +
-                                "                    \"brands\": {\n" +
-                                "                        \"indices\": \"manufacturers\",\n" +
-                                "                        \"types\": [\"brand\"],\n" +
-                                "                        \"query\" : {\n" +
-                                "                              \"match_all\" : {}\n" +
-                                "                        },\n" +
-                                "                        \"sort\" : [\n" +
-                                "                              { \"name\" : \"asc\" },\n"+
-                                "                              { \"country\" : \"asc\" }\n"+
-                                "                        ],\n"+
-                                "                        \"fields\" : [ \"name\" ]\n"+
-                                "                    }\n" +
-                                "                }\n" +
-                                "            ],\n" +
-                                "            \"view\" : \"@includeNamed{'list-of-products-with-brands'; title='Welcome'}\"\n" +
-                                "        }\n" +
-                                "    }\n" +
-                                "}")
-        );
-
-        ViewResponse response = esSetup.client().execute(ViewAction.INSTANCE, new ViewRequest("web", "pages", "home")).get();
-        assertEquals(fromClassPath("org/elasticsearch/test/integration/views/config/views/list-of-products-with-brands.html").toString(), new String(response.content(), "UTF-8"));
-    }
-
 
     @After
     public void tearDown() throws Exception {
-        esSetup.terminate();
+    	node.close();
     }
 }

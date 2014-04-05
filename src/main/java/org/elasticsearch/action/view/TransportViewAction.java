@@ -1,25 +1,11 @@
-/*
- * Licensed to Elastic Search and Shay Banon under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. Elastic Search licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
 package org.elasticsearch.action.view;
 
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 import org.elasticsearch.ElasticSearchException;
-import org.elasticsearch.ElasticSearchIllegalArgumentException;
 import org.elasticsearch.ElasticSearchParseException;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchResponse;
@@ -31,10 +17,10 @@ import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.cluster.block.ClusterBlockLevel;
 import org.elasticsearch.cluster.metadata.MappingMetaData;
 import org.elasticsearch.cluster.routing.ShardIterator;
-import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.collect.ImmutableMap;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.engine.Engine;
 import org.elasticsearch.index.get.GetResult;
 import org.elasticsearch.index.service.IndexService;
 import org.elasticsearch.index.shard.service.IndexShard;
@@ -43,258 +29,314 @@ import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.elasticsearch.search.sort.SortOrder;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
-import org.elasticsearch.view.exception.ElasticSearchViewNotFoundException;
 import org.elasticsearch.view.ViewContext;
-import org.elasticsearch.view.ViewResult;
-import org.elasticsearch.view.ViewService;
+import org.elasticsearch.view.exception.ElasticSearchViewNotFoundException;
+import org.elasticsearch.view.mustache.MustacheViewEngineService;
 
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+public class TransportViewAction
+		extends
+		TransportShardSingleOperationAction<ViewRequest, ViewResponse> {
 
+	public static boolean REFRESH_FORCE = false;
 
-public class TransportViewAction extends TransportShardSingleOperationAction<ViewRequest, ViewResponse> {
+	private final IndicesService indicesService;
+	private final TransportSearchAction searchAction;
+	private final boolean realtime;
 
-    private final ViewService viewService;
-    private final IndicesService indicesService;
-    private final TransportSearchAction searchAction;
+	@Inject
+	public TransportViewAction(Settings settings,
+			ClusterService clusterService, TransportService transportService,
+			IndicesService indicesService, TransportSearchAction searchAction,
+			ThreadPool threadPool) {
+		super(settings, threadPool, clusterService, transportService);
+		this.indicesService = indicesService;
+		this.searchAction = searchAction;
 
-    @Inject
-    public TransportViewAction(Settings settings, ThreadPool threadPool,
-                               ClusterService clusterService,
-                               TransportService transportService,
-                               IndicesService indicesService,
-                               ViewService viewService,
-                               TransportSearchAction searchAction) {
-        super(settings, threadPool, clusterService, transportService);
-        this.indicesService = indicesService;
-        this.viewService = viewService;
-        this.searchAction = searchAction;
-    }
+		this.realtime = settings.getAsBoolean("action.get.realtime", true);
+	}
 
-    @Override
-    protected String executor() {
-        return ThreadPool.Names.GENERIC;
-    }
+	@Override
+	protected String executor() {
+		return ThreadPool.Names.GET;
+	}
 
-    @Override
-    protected ViewRequest newRequest() {
-        return new ViewRequest();
-    }
+	@Override
+	protected String transportAction() {
+		return ViewAction.NAME;
+	}
 
-    @Override
-    protected ViewResponse newResponse() {
-        return new ViewResponse();
-    }
+	@Override
+	protected ClusterBlockException checkGlobalBlock(ClusterState state,
+			ViewRequest request) {
+		return state.blocks().globalBlockedException(ClusterBlockLevel.READ);
+	}
 
-    @Override
-    protected String transportAction() {
-        return ViewAction.NAME;
-    }
+	@Override
+	protected ClusterBlockException checkRequestBlock(ClusterState state,
+			ViewRequest request) {
+		return state.blocks().indexBlockedException(ClusterBlockLevel.READ,
+				request.index());
+	}
 
-    @Override
-    protected ClusterBlockException checkGlobalBlock(ClusterState state, ViewRequest request) {
-        return state.blocks().globalBlockedException(ClusterBlockLevel.READ);
-    }
+	@Override
+	protected ShardIterator shards(ClusterState state,
+			ViewRequest request) {
+		return clusterService.operationRouting().getShards(
+				clusterService.state(), request.index(), request.type(),
+				request.id(), request.routing(), request.preference());
+	}
 
-    @Override
-    protected ClusterBlockException checkRequestBlock(ClusterState state, ViewRequest request) {
-        return state.blocks().indexBlockedException(ClusterBlockLevel.READ, request.index());
-    }
+	@Override
+	protected void resolveRequest(ClusterState state,
+			ViewRequest request) {
+		if (request.realtime == null) {
+			request.realtime = this.realtime;
+		}
+		// update the routing (request#index here is possibly an alias)
+		request.routing(state.metaData().resolveIndexRouting(request.routing(),
+				request.index()));
+		request.index(state.metaData().concreteIndex(request.index()));
+	}
 
-    @Override
-    protected ShardIterator shards(ClusterState state, ViewRequest request) {
-        return clusterService.operationRouting()
-                .getShards(clusterService.state(), request.index(), request.type(), request.id(), null, null);
-    }
+	@Override
+	protected ViewResponse shardOperation(
+			ViewRequest request, int shardId)
+			throws ElasticSearchException {
+		IndexService indexService = indicesService.indexServiceSafe(request
+				.index());
+		IndexShard indexShard = indexService.shardSafe(shardId);
 
-    @Override
-    protected ViewResponse shardOperation(ViewRequest request, int shardId) throws ElasticSearchException {
+		if (request.refresh() && !request.realtime()) {
+			indexShard.refresh(new Engine.Refresh("refresh_flag_get")
+					.force(REFRESH_FORCE));
+		}
 
-        // Get the doc first
-        IndexService indexService = indicesService.indexService(request.index());
-        IndexShard indexShard = indexService.shardSafe(shardId);
-        GetResult getResult = indexShard.getService().get(request.type(), request.id(), null, false);
+		GetResult result = indexShard.getService().get(request.type(),
+				request.id(), request.fields(), request.realtime());
+		
+		String format = ViewRequest.DEFAULT_VIEW;
+		// Try to get a view stored at document level
+		ViewContext viewContext = extract(result.sourceAsMap(), format);
 
-        if (!getResult.exists()) {
-            throw new ElasticSearchIllegalArgumentException("Document not found, cannot render view");
-        }
+		if (viewContext == null) {
+			// Then, get the view stored in the mapping _meta field
+			MappingMetaData mappingMetaData = clusterService.state().metaData()
+					.index(request.index()).mapping(request.type());
+			if (mappingMetaData != null) {
+				try {
+					Map<String, Object> mapping = mappingMetaData.sourceAsMap();
+					viewContext = extract(mapping, format);
+				} catch (IOException e) {
+					throw new ElasticSearchParseException(
+							"Failed to parse mapping content to map", e);
+				}
+			}
+		}
 
-        // Try to get a view stored at document level
-        ViewContext viewContext = extract(getResult.sourceAsMap(), request.format());
+		if (viewContext == null) {
+			throw new ElasticSearchViewNotFoundException("No view [" + format
+					+ "] found for document type [" + request.type() + "]");
+		}
+		
 
-        if (viewContext == null) {
-            // Then, get the view stored in the mapping _meta field
-            MappingMetaData mappingMetaData = clusterService.state().metaData().index(request.index()).mapping(request.type());
-            if (mappingMetaData != null) {
-                try {
-                    Map<String, Object> mapping = mappingMetaData.sourceAsMap();
-                    viewContext = extract(mapping, request.format());
-                } catch (IOException e) {
-                    throw new ElasticSearchParseException("Failed to parse mapping content to map", e);
-                }
-            }
-        }
+		// Set some org.elasticsearch.test.integration.views.mappings.data
+		// required for view rendering
+		viewContext.index(result.getIndex()).type(result.getType())
+				.id(result.getId()).version(result.getVersion())
+				.source(result.sourceAsMap());
+		
+		// Ok, let's render it with a ViewEngineService
+		MustacheViewEngineService viewEngineService = new MustacheViewEngineService(
+				settings); 
+		String viewResult = viewEngineService.render(
+				viewContext.view(), viewContext.varsAsMap());
+		
+		return new ViewResponse(result, viewResult);
+	}
 
-        if (viewContext == null) {
-            throw new ElasticSearchViewNotFoundException("No view [" + request.format() + "] found for document type [" + request.type() + "]");
-        }
+	private ViewContext extract(Map<String, Object> sourceAsMap, String format) {
+		if (sourceAsMap != null) {
+			for (String key : sourceAsMap.keySet()) {
+				Object views = null;
 
-        // Set some org.elasticsearch.test.integration.views.mappings.data required for view rendering
-        viewContext.index(getResult.index())
-                .type(getResult.type())
-                .id(getResult.id())
-                .version(getResult.version())
-                .source(getResult.sourceAsMap());
+				// When searching in a mapping
+				if ("_meta".equals(key)) {
+					Object meta = sourceAsMap.get(key);
+					if (meta instanceof Map) {
+						views = ((Map) meta).get("views");
+					}
+				}
 
-        // Ok, let's render it with a ViewEngineService
-        ViewResult result = viewService.render(viewContext);
+				// When searching in the document content
+				if ("query_views".equals(key)) {
+					views = sourceAsMap.get(key);
+				}
 
-        return new ViewResponse(result.contentType(), result.content());
-    }
+				if ((views != null) && (views instanceof Map)) {
+					Map mapViews = (Map) views;
+					Object candidate = null;
 
-    private ViewContext extract(Map<String, Object> sourceAsMap, String format) {
-        if (sourceAsMap != null) {
-            for (String key : sourceAsMap.keySet()) {
-                Object views = null;
+					// Try to load a specific view
+					if (format != null) {
+						candidate = mapViews.get(format);
+					} else if (!mapViews.isEmpty()) {
+						// Try to load the "default" view
+						Object defaultView = mapViews
+								.get(ViewRequest.DEFAULT_VIEW);
+						if (defaultView != null) {
+							candidate = defaultView;
+						}
+					}
+					if ((candidate != null) && (candidate instanceof Map)) {
+						Map mapCandidate = (Map) candidate;
 
-                // When searching in a mapping
-                if ("_meta".equals(key)) {
-                    Object meta = sourceAsMap.get(key);
-                    if (meta instanceof Map) {
-                        views = ((Map) meta).get("views");
-                    }
-                }
+						// ViewContext holds the
+						// org.elasticsearch.test.integration.views.mappings.data
+						// for view rendering
+						ViewContext viewContext = new ViewContext(
+								(String) mapCandidate.get("view_lang"),
+								(String) mapCandidate.get("view"),
+								(String) mapCandidate.get("content_type"));
 
-                // When searching in the document content
-                if ("views".equals(key)) {
-                    views = sourceAsMap.get(key);
-                }
+						Object queries = mapCandidate.get("queries");
+						Map<String, Object> mapQueries = null;
 
-                if ((views != null) && (views instanceof Map)) {
-                    Map mapViews = (Map) views;
-                    Object candidate = null;
+						if (queries != null) {
+							if (queries instanceof List) {
+								List listQueries = (List) queries;
+								mapQueries = new HashMap<String, Object>(
+										listQueries.size());
+								for (Object query : listQueries) {
+									if (query instanceof Map) {
+										Map q = (Map) query;
+										for (Object queryName : q.keySet()) {
+											if (queryName instanceof String) {
+												mapQueries.put(
+														(String) queryName,
+														q.get(queryName));
+											}
+										}
+									}
+								}
+							} else if (queries instanceof Map) {
+								mapQueries = (Map) queries;
+							}
+						}
 
-                    // Try to load a specific view
-                    if (format != null) {
-                        candidate = mapViews.get(format);
-                    } else if (!mapViews.isEmpty()) {
-                        // Try to load the "default" view
-                        Object defaultView = mapViews.get(ViewRequest.DEFAULT_VIEW);
-                        if (defaultView != null) {
-                            candidate = defaultView;
-                        }
-                    }
-                    if ((candidate != null) && (candidate instanceof Map)) {
-                        Map mapCandidate = (Map) candidate;
+						if (mapQueries != null) {
+							for (String queryName : mapQueries.keySet()) {
+								try {
+									Map<String, Object> mapQuery = (Map) mapQueries
+											.get(queryName);
 
-                        // ViewContext holds the org.elasticsearch.test.integration.views.mappings.data for view rendering
-                        ViewContext viewContext = new ViewContext((String) mapCandidate.get("view_lang"), (String) mapCandidate.get("view"), (String) mapCandidate.get("content_type"));
+									String[] indices = null;
+									if (mapQuery.get("indices") instanceof List) {
+										indices = (String[]) ((List) mapQuery
+												.get("indices"))
+												.toArray(new String[0]);
+									} else if (mapQuery.get("indices") instanceof String) {
+										indices = new String[] { ((String) mapQuery
+												.get("indices")) };
+									}
 
-                        Object queries = mapCandidate.get("queries");
-                        Map<String, Object> mapQueries = null;
+									String[] types = null;
+									if (mapQuery.get("types") instanceof List) {
+										types = (String[]) ((List) mapQuery
+												.get("types"))
+												.toArray(new String[0]);
+									} else if (mapQuery.get("types") instanceof String) {
+										types = new String[] { ((String) mapQuery
+												.get("types")) };
+									}
 
-                        if (queries != null) {
-                            if (queries instanceof List) {
-                                List listQueries = (List) queries;
-                                mapQueries = new HashMap<String, Object>(listQueries.size());
-                                for (Object query : listQueries) {
-                                    if (query instanceof Map) {
-                                        Map q = (Map) query;
-                                        for (Object queryName : q.keySet()) {
-                                            if (queryName instanceof String) {
-                                                mapQueries.put((String) queryName, q.get(queryName));
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if (queries instanceof Map) {
-                                mapQueries = (Map) queries;
-                            }
-                        }
+									SearchSourceBuilder searchSourceBuilder = null;
+									if (mapQuery.get("sort") instanceof List) {
+										if (searchSourceBuilder == null) {
+											searchSourceBuilder = new SearchSourceBuilder();
+										}
+										for (Object sort : (List) mapQuery
+												.get("sort")) {
+											if (sort instanceof String) {
+												searchSourceBuilder
+														.sort((String) sort);
+											} else if (sort instanceof Map) {
+												for (Object field : ((Map) sort)
+														.keySet()) {
+													String sortField = (String) field;
+													String reverse = (String) ((Map) sort)
+															.get(field);
+													if ("asc".equals(reverse)) {
+														searchSourceBuilder
+																.sort(sortField,
+																		SortOrder.ASC);
+													} else if ("desc"
+															.equals(reverse)) {
+														searchSourceBuilder
+																.sort(sortField,
+																		SortOrder.DESC);
+													}
+												}
+											}
+										}
+									}
 
-                        if (mapQueries != null) {
-                            for (String queryName : mapQueries.keySet()) {
-                                try {
-                                    Map<String, Object> mapQuery = (Map) mapQueries.get(queryName);
+									if (mapQuery.get("fields") instanceof List) {
+										if (searchSourceBuilder == null) {
+											searchSourceBuilder = new SearchSourceBuilder();
+										}
+										for (Object field : (List) mapQuery
+												.get("fields")) {
+											if (field instanceof String) {
+												searchSourceBuilder
+														.field((String) field);
+											}
+										}
+									}
 
-                                    String[] indices = null;
-                                    if (mapQuery.get("indices") instanceof List) {
-                                        indices = (String[]) ((List) mapQuery.get("indices")).toArray(new String[0]);
-                                    } else if (mapQuery.get("indices") instanceof String) {
-                                        indices = new String[]{((String) mapQuery.get("indices"))};
-                                    }
+									SearchRequest searchRequest = new SearchRequest();
+									if (indices != null) {
+										searchRequest.indices(indices);
+									}
+									if (types != null) {
+										searchRequest.types(types);
+									}
 
-                                    String[] types = null;
-                                    if (mapQuery.get("types") instanceof List) {
-                                        types = (String[]) ((List) mapQuery.get("types")).toArray(new String[0]);
-                                    } else if (mapQuery.get("types") instanceof String) {
-                                        types = new String[]{((String) mapQuery.get("types"))};
-                                    }
+									ImmutableMap.Builder<String, Object> builder = ImmutableMap
+											.builder();
+									builder.put("query",
+											(Map) mapQuery.get("query"));
+									searchRequest.source(builder.build());
 
-                                    SearchSourceBuilder searchSourceBuilder = null;
-                                    if (mapQuery.get("sort") instanceof List) {
-                                        if (searchSourceBuilder == null) {
-                                            searchSourceBuilder = new SearchSourceBuilder();
-                                        }
-                                        for (Object sort : (List) mapQuery.get("sort")) {
-                                            if (sort instanceof String) {
-                                                searchSourceBuilder.sort((String) sort);
-                                            } else if (sort instanceof Map) {
-                                                for (Object field : ((Map) sort).keySet()) {
-                                                    String sortField = (String) field;
-                                                    String reverse = (String) ((Map) sort).get(field);
-                                                    if ("asc".equals(reverse)) {
-                                                        searchSourceBuilder.sort(sortField, SortOrder.ASC);
-                                                    } else if ("desc".equals(reverse)) {
-                                                        searchSourceBuilder.sort(sortField, SortOrder.DESC);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+									if (searchSourceBuilder != null) {
+										searchRequest
+												.extraSource(searchSourceBuilder);
+									}
 
-                                    if (mapQuery.get("fields") instanceof List) {
-                                        if (searchSourceBuilder == null) {
-                                            searchSourceBuilder = new SearchSourceBuilder();
-                                        }
-                                        for (Object field : (List) mapQuery.get("fields")) {
-                                            if (field instanceof String) {
-                                                searchSourceBuilder.field((String) field);
-                                            }
-                                        }
-                                    }
+									SearchResponse searchResponse = searchAction
+											.execute(searchRequest).get();
+									viewContext.queriesAndHits(queryName,
+											searchResponse.getHits());
 
-                                    SearchRequest searchRequest = new SearchRequest();
-                                    if (indices != null) {
-                                        searchRequest.indices(indices);
-                                    }
-                                    if (types != null) {
-                                        searchRequest.types(types);
-                                    }
+								} catch (Exception e) {
+									viewContext.queriesAndHits(queryName, null);
+								}
+							}
+						}
+						return viewContext;
+					}
+				}
+			}
+		}
+		return null;
+	}
 
-                                    ImmutableMap.Builder<String, Object> builder = ImmutableMap.builder();
-                                    builder.put("query", (Map) mapQuery.get("query"));
-                                    searchRequest.source(builder.build());
+	@Override
+	protected ViewRequest newRequest() {
+		return new ViewRequest();
+	}
 
-                                    if (searchSourceBuilder != null) {
-                                        searchRequest.extraSource(searchSourceBuilder);
-                                    }
-
-                                    SearchResponse searchResponse = searchAction.execute(searchRequest).get();
-                                    viewContext.queriesAndHits(queryName, searchResponse.hits());
-
-                                } catch (Exception e) {
-                                    viewContext.queriesAndHits(queryName, null);
-                                }
-                            }
-                        }
-                        return viewContext;
-                    }
-                }
-            }
-        }
-        return null;
-    }
+	@Override
+	protected ViewResponse newResponse() {
+		return new ViewResponse();
+	}
 }
